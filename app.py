@@ -1,12 +1,20 @@
 from flask import Flask, request, jsonify, make_response
 from pymongo import MongoClient
 from bson import ObjectId
+import bcrypt
+
+import jwt
+import datetime
+from functools import wraps
 
 app = Flask(__name__)
 
 client = MongoClient("mongodb://127.0.0.1:27017")
 db = client["bizDB"]      # select the database
-businesses = db["biz"]    # select the collection
+users_collection = db['biz']
+app.config['SECRET_KEY'] = 'mysecret'
+blacklist_collection = db['blacklist']
+
 
 # application functionality will go here
 
@@ -162,6 +170,121 @@ def add_new_review(id):
     
     new_review_link = f"http://localhost:5000/api/v1.0/businesses/{id}/reviews/{new_review['_id']}"
     return make_response(jsonify({"url": new_review_link}), 201)
+
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    auth = request.authorization
+    if not auth or not auth.username or not auth.password:
+        return make_response('Could not verify', 401, {'WWW-Authenticate': 'Basic realm="Login required"'})
+    
+    # Fetch user from the database and verify password
+    user = users_collection.find_one({'username': auth.username})
+    if not user:
+        return jsonify({'message': 'User not found!'}), 404
+
+    # Verify password using bcrypt
+    if bcrypt.checkpw(auth.password.encode('utf-8'), user['password']):
+        # Generate JWT token
+        token = jwt.encode({
+            'user': user['username'],
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+
+        return jsonify({'token': token.decode('UTF-8')})
+    
+    return make_response('Could not verify', 401, {'WWW-Authenticate': 'Basic realm="Login required"'})
+
+
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('x-access-token')
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 403
+        
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 403
+        
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route('/businesses', methods=['GET'])
+@token_required
+def get_businesses():
+    businesses = db['businesses'].find()  # Assuming you have a businesses collection
+    output = []
+    for business in businesses:
+        output.append({'name': business['name'], 'rating': business['rating']})
+    
+    return jsonify({'businesses': output})
+
+
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    hashed_password = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt())
+    
+    users_collection.insert_one({
+        'username': data['username'],
+        'password': hashed_password,
+        'admin': False  # Or True for admin users
+    })
+
+    return jsonify({'message': 'User registered successfully!'})
+
+
+@app.route('/logout', methods=['GET'])
+@token_required
+def logout():
+    token = request.headers.get('x-access-token')
+    blacklist_collection.insert_one({'token': token})
+    return jsonify({'message': 'Logout successful!'})
+
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('x-access-token')
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 403
+        
+        if blacklist_collection.find_one({'token': token}):
+            return jsonify({'message': 'Token has been blacklisted!'}), 403
+        
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 403
+        
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('x-access-token')
+        data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+        if not data['admin']:
+            return jsonify({'message': 'Admin access required!'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route('/businesses/<id>', methods=['DELETE'])
+@token_required
+@admin_required
+def remove_business(id):
+    db['businesses'].delete_one({'_id': id})
+    return jsonify({'message': 'Business deleted!'})
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)  # Start the Flask application
